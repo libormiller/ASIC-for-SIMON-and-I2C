@@ -1,0 +1,19 @@
+# --- Specifické požadavky ---
+__pycache__/
+materiály/
+sim_build/
+sim_env/
+results.xml
+
+# --- Python ---
+*.py[cod]
+*$py.class
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- Linux ---
+.DS_Store
+.directory
+*~
