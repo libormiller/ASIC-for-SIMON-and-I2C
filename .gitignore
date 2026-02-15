@@ -4,6 +4,10 @@ materiály/
 sim_build/
 sim_env/
 results.xml
+cocotb_waveform.vcd
+full_test
+sim_full
+rounds_debug.vcd
 
 # --- Python ---
 *.py[cod]
