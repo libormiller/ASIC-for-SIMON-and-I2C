@@ -1,15 +1,10 @@
 import cocotb
 import random
 from cocotb.clock import Clock
-# Přidali jsme Lock (pro synchronizaci sběrnice) a Combine (pro čekání na všechna vlákna)
 from cocotb.triggers import Timer, RisingEdge, Lock, Combine 
-
-# Import profesionálního I2C Mastera
 from cocotbext.i2c import I2cMaster
 
-# ==============================================================================
-# 1. REFERENČNÍ MODEL (SIMON 32/64)
-# ==============================================================================
+# referenční model simon 32/64
 def rotl(x, k): return ((x << k) & 0xFFFF) | (x >> (16 - k))
 def rotr(x, k): return ((x >> k) & 0xFFFF) | ((x << (16 - k)) & 0xFFFF)
 
@@ -28,118 +23,91 @@ def simon_32_64_gold(plaintext_int, key_int):
         key = key[1:] + [k_new]
     return ((L & 0xFFFF) << 16) | (R & 0xFFFF)
 
-# ==============================================================================
-# 2. TESTBENCH POMOCÍ COCOTBEXT-I2C (MULTITHREADED)
-# ==============================================================================
-
 I2C_ADDR = 0x50 
 
 @cocotb.test()
 async def test_simon_massive_multithreaded(dut):
     """
-    Multithreaded ověření: 12 vláken generuje zátěž na I2C sběrnici.
+    Testuje náhodně ENCRYPT i DECRYPT operace s manuálním řízením Start bitu.
     """
     
-    # 1. Spuštění hodin (100 MHz)
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    
-    # 2. Inicializace I2C Mastera
     i2c = I2cMaster(sda=dut.sda_pin, scl=dut.scl_pin, speed=100e3)
 
-    # --- aby máster nebombil silnou jedničku (oprava trvala cca 4 hodiny než jsem na to přišel)---
-    def open_drain_sda(val):
-        dut.sda_master_en.value = 1 if val else 0
-
-    def open_drain_scl(val):
-        dut.scl_master_en.value = 1 if val else 0
-
+    # open-drain konfigurace pro simulaci
+    def open_drain_sda(val): dut.sda_master_en.value = 1 if val else 0
+    def open_drain_scl(val): dut.scl_master_en.value = 1 if val else 0
     i2c._set_sda = open_drain_sda
     i2c._set_scl = open_drain_scl
     
-    dut._log.info("--- RESET ---")
     dut.rst.value = 1
-    await Timer(100, unit="ns")
+    await Timer(200, unit="ns")
     dut.rst.value = 0
     await Timer(1000, unit="ns")
     
-    # --------------------------------------------------------------------------
-    # PŘÍPRAVA NA MULTITHREADING
-    # --------------------------------------------------------------------------
-    
-    # Sanity Check - Bus Scan (Provedeme jednou před spuštěním vláken)
-    dut._log.info("--- PRE-FLIGHT CHECK: Bus Scan ---")
-    try:
-        await i2c.read(I2C_ADDR, 1)
-        dut._log.info(f"✅ Zařízení nalezeno.")
-    except Exception as e:
-        dut._log.error(f"❌ Zařízení neodpovídá!")
-        raise e
-
-    # Zámek pro I2C sběrnici.
-    # Toto je kritické: Zajistí, že když jedno vlákno zapisuje Klíč a Data,
-    # žádné jiné vlákno mu do toho neskočí, dokud není hotový Read.
     bus_lock = Lock()
-
-    # Počet vláken a iterací
     NUM_THREADS = 12
     ITERS_PER_THREAD = 1
 
-    dut._log.info(f"--- STARTING {NUM_THREADS} THREADS ({ITERS_PER_THREAD} iters each) ---")
 
-    # Definice Worker Funkce (jedno vlákno)
+    #každé vlákno si spowne tento worker; vytvoří náhodné klíče,
+    #náhodné plaintexty a náhodný mód šifrování/dešifrování, 
+    #celé to zvaliduje pomocí referenčního modelu simon_32_64_gold
     async def stress_worker(thread_id):
         for i in range(ITERS_PER_THREAD):
-            # 1. Generování dat (běží paralelně, neblokuje sběrnici)
-            k = random.getrandbits(64)
-            p = random.getrandbits(32)
-            exp = simon_32_64_gold(p, k)
+            mode = random.randint(0, 1) # 0=Enc, 1=Dec
             
-            kb = list(k.to_bytes(8, 'little'))
-            pb = list(p.to_bytes(4, 'little'))
+            k = random.getrandbits(64)
+            data_in = random.getrandbits(32)
+            
+            if mode == 0:
+                # Zašifruj
+                exp = simon_32_64_gold(data_in, k)
+                cmd_load = 0x01 # Bit0=1 (Start), Bit1=0 (Enc)
+                cmd_run  = 0x00 # Bit0=0 (Run),   Bit1=0 (Enc)
+                mode_str = "ENC"
+                input_val = data_in
+            else:
+                # Rozšifruj
+                plain = data_in
+                input_val = simon_32_64_gold(plain, k)
+                exp = plain
+                cmd_load = 0x03 # Bit0=1 (Start), Bit1=1 (Dec)
+                cmd_run  = 0x02 # Bit0=0 (Run),   Bit1=1 (Dec)
+                mode_str = "DEC"
 
-            # 2. KRITICKÁ SEKCE - Přístup k I2C
-            # Musíme zamknout celou sekvenci operací, protože Simon má stavové registry.
+            kb = list(k.to_bytes(8, 'little'))
+            ib = list(input_val.to_bytes(4, 'little'))
+
+            #zámek aby jen jedno vlákno kontrolovalo i2c sběrnici
             async with bus_lock:
-                # Zápis Key (0x00)
-                await i2c.write(I2C_ADDR, [0x00] + kb)
-                # Zápis Plaintext (0x08)
-                await i2c.write(I2C_ADDR, [0x08] + pb)
-                # Start (0x0C)
-                await i2c.write(I2C_ADDR, [0x0C, 0x01])
+                # 1. zápis konfigurace
+                await i2c.write(I2C_ADDR, [0x00] + kb) # klíč
+                await i2c.write(I2C_ADDR, [0x08] + ib) # data
                 
-                # Čekání na výpočet HW
-                await Timer(2, unit="us")
+                # 2. reset jádra & load dat (Start=1)
+                await i2c.write(I2C_ADDR, [0x0C, cmd_load])
                 
-                # Čtení výsledku (0x10)
+                # 3. spuštění výpočtu (Start=0), Mode musí zůstat stejný!
+                await i2c.write(I2C_ADDR, [0x0C, cmd_run])
+                
+                # 4. Čekání (Decryption trvá déle kvůli pre-compute)
+                await Timer(3, unit="us")
+                
+                # 5. Čtení výsledku
                 await i2c.write(I2C_ADDR, [0x10])
                 rb = await i2c.read(I2C_ADDR, 4)
             
-            # 3. Vyhodnocení (mimo zámek, uvolníme sběrnici co nejdříve)
             val = int.from_bytes(rb, 'little')
             
+            #vyhodnocení výsledků
             if val != exp:
-                dut._log.error(f"[T{thread_id}] Iter {i} FAILED")
-                dut._log.error(f"Key: {hex(k)}")
-                dut._log.error(f"Plain: {hex(p)}")
-                dut._log.error(f"Exp: {hex(exp)}")
-                dut._log.error(f"Got: {hex(val)}")
-                raise Exception(f"Thread {thread_id} Failed at iter {i}")
+                raise Exception(f"[T{thread_id}] {mode_str} FAIL! Exp: {hex(exp)}, Got: {hex(val)}")
             
-            # Logujeme jen občas, ať nezahltíme konzoli
-            if i % 50 == 0:
-                dut._log.info(f"[T{thread_id}] Iter {i} OK")
+            if i % 2 == 0:
+                dut._log.info(f"[T{thread_id}] Iter {i} {mode_str} OK")
 
-        dut._log.info(f"✅ [T{thread_id}] DONE")
-
-    # --------------------------------------------------------------------------
-    # SPUŠTĚNÍ VLÁKEN
-    # --------------------------------------------------------------------------
-    tasks = []
-    for t in range(NUM_THREADS):
-        # start_soon spustí "vlákno" (coroutinu)
-        tasks.append(cocotb.start_soon(stress_worker(t)))
-
-    # Čekáme, až všech 12 vláken skončí
+    tasks = [cocotb.start_soon(stress_worker(t)) for t in range(NUM_THREADS)]
     await Combine(*tasks)
             
-    dut._log.info("🎉🎉🎉 MULTITHREADED TEST COMPLETE - ALL PASSED 🎉🎉🎉")
+    dut._log.info("Prošlo to...díky vesmíre")
